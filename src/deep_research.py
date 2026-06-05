@@ -12,8 +12,9 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from src.model_context import estimate_tokens, get_runtime_capabilities
 from src.research_utils import strip_thinking, is_low_quality
 
 from src.goal_based_extractor import EXTRACTOR_PROMPT
@@ -236,6 +237,13 @@ class DeepResearcher:
         self.findings: List[Dict] = []
         self.evolving_report: str = ""
         self.research_plan: str = ""
+        self.runtime_context_tokens: int = 0
+        self.runtime_slots: Optional[int] = None
+        self.runtime_source: str = "unknown"
+        self.safe_context_tokens: int = 0
+        self.adaptive_warnings: List[str] = []
+        self._adaptive_warning_keys: Set[str] = set()
+        self._last_llm_error: str = ""
 
     def cancel(self):
         """Request cooperative cancellation of the research loop."""
@@ -260,6 +268,7 @@ class DeepResearcher:
             prior_urls: URLs already visited (won't be re-fetched).
         """
         self._start_time = time.time()
+        await self._configure_runtime_capabilities()
         findings: List[Dict] = list(prior_findings) if prior_findings else []
         report = prior_report or ""
 
@@ -323,7 +332,7 @@ class DeepResearcher:
                     err_detail = getattr(self, '_last_search_error', 'unknown error')
                     self._emit(phase="error", message=f"Search engine unavailable: {err_detail}")
                     if not findings:
-                        return (
+                        return self._with_adaptive_warnings(
                             f"**Search unavailable** — Web search failed after "
                             f"{round_num} rounds. Error: {err_detail}\n\n"
                             "Please check your search provider settings and ensure the service is running."
@@ -357,8 +366,10 @@ class DeepResearcher:
                     "Synthesis produced no report; returning %d gathered "
                     "finding(s) as a fallback", len(findings)
                 )
-                return self._fallback_report(question, findings)
-            return "No information could be gathered for this question."
+                fallback = self._fallback_report(question, findings)
+                self.evolving_report = fallback
+                return self._with_adaptive_warnings(fallback)
+            return self._with_adaptive_warnings(self._no_findings_report())
 
         self.evolving_report = report  # preserve pre-synthesis report
         final = await self._final_report(question, report)
@@ -368,25 +379,62 @@ class DeepResearcher:
             f"{len(findings)} findings, {len(self.urls_fetched)} URLs, "
             f"{elapsed:.1f}s"
         )
-        return final
+        return self._with_adaptive_warnings(final)
 
     # ------------------------------------------------------------------
     # LLM helper
     # ------------------------------------------------------------------
     async def _llm(self, messages: List[Dict], temperature: float = 0.3,
                    max_tokens: int = 4096, timeout: int = 60) -> str:
-        """Call the LLM asynchronously and strip thinking tags."""
+        """Call the LLM without exceeding the active runtime's context."""
         from src.llm_core import llm_call_async
-        response = await llm_call_async(
-            url=self.llm_endpoint,
-            model=self.llm_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=self.llm_headers,
-            timeout=timeout,
-        )
-        return strip_thinking(response)
+
+        requested_tokens = max(1, int(max_tokens or 1))
+        safe_context = int(getattr(self, "safe_context_tokens", 0) or 0)
+        fitted_messages = [dict(message) for message in messages]
+        adjusted_tokens = requested_tokens
+
+        if safe_context:
+            input_budget = self._input_budget_for(requested_tokens)
+            fitted_messages, trimmed = self._fit_messages_to_input_budget(
+                fitted_messages, input_budget or 1,
+            )
+            prompt_tokens = estimate_tokens(fitted_messages)
+            if prompt_tokens >= safe_context:
+                error = (
+                    f"Research prompt requires about {prompt_tokens} tokens but "
+                    f"the model runtime allows {safe_context} safe tokens."
+                )
+                self._last_llm_error = error
+                raise RuntimeError(error)
+            adjusted_tokens = min(requested_tokens, safe_context - prompt_tokens)
+            if trimmed:
+                self._warn_adaptive(
+                    "prompt-trim",
+                    f"Model context is limited to {self.runtime_context_tokens} tokens; "
+                    "oversized research prompts were trimmed.",
+                )
+            if adjusted_tokens < requested_tokens:
+                self._warn_adaptive(
+                    "output-clamp",
+                    f"Requested model output was reduced to fit the "
+                    f"{self.runtime_context_tokens}-token runtime context.",
+                )
+
+        try:
+            response = await llm_call_async(
+                url=self.llm_endpoint,
+                model=self.llm_model,
+                messages=fitted_messages,
+                temperature=temperature,
+                max_tokens=adjusted_tokens,
+                headers=self.llm_headers,
+                timeout=timeout,
+            )
+            return strip_thinking(response)
+        except Exception as exc:
+            self._last_llm_error = str(exc)
+            raise
 
     # ------------------------------------------------------------------
     # PLAN: create research strategy
@@ -468,14 +516,24 @@ class DeepResearcher:
                 "that the report doesn't yet cover well."
             )
 
-        prompt = current_date_context() + QUERY_GEN_PROMPT.format(
-            question=question,
-            research_plan=self.research_plan or "(No plan — search broadly.)",
-            report=report or "(No findings yet.)",
-            round_num=round_num,
-            num_queries=num_queries,
-            round_instruction=round_instruction,
+        def _build_prompt(report_text: str) -> str:
+            return current_date_context() + QUERY_GEN_PROMPT.format(
+                question=question,
+                research_plan=self.research_plan or "(No plan — search broadly.)",
+                report=report_text or "(No findings yet.)",
+                round_num=round_num,
+                num_queries=num_queries,
+                round_instruction=round_instruction,
+            )
+
+        report_for_prompt = self._fit_text_for_prompt(
+            report,
+            _build_prompt,
+            requested_output=4096,
+            warning_key="query-report-trim",
+            warning_message="The evolving report was trimmed while generating follow-up queries.",
         )
+        prompt = _build_prompt(report_for_prompt)
 
         try:
             response = await self._llm(
@@ -622,7 +680,17 @@ class DeepResearcher:
             else:
                 content = truncated
 
-        prompt = EXTRACTOR_PROMPT.format(webpage_content=content, goal=question)
+        def _build_prompt(page_content: str) -> str:
+            return EXTRACTOR_PROMPT.format(webpage_content=page_content, goal=question)
+
+        content = self._fit_text_for_prompt(
+            content,
+            _build_prompt,
+            requested_output=2048,
+            warning_key="extraction-content-trim",
+            warning_message="Webpage content was trimmed to fit the model runtime context.",
+        )
+        prompt = _build_prompt(content)
 
         try:
             response = await self._llm(
@@ -660,17 +728,10 @@ class DeepResearcher:
     async def _synthesize(self, question: str, findings: List[Dict],
                           current_report: str) -> str:
         """LLM synthesizes all findings into an updated report."""
-        # Format findings for the prompt
         window = findings[-self.synthesis_window:]
         if len(findings) > self.synthesis_window:
             logger.info(f"Synthesis using last {self.synthesis_window} of {len(findings)} findings")
-        findings_text = self._format_findings(window)
-
-        prompt = SYNTHESIZE_PROMPT.format(
-            question=question,
-            report=current_report or "(First round — no report yet.)",
-            new_findings=findings_text,
-        )
+        prompt = self._build_synthesis_prompt(question, current_report, window)
 
         try:
             return await self._llm(
@@ -694,11 +755,21 @@ class DeepResearcher:
     async def _should_stop(self, question: str, report: str,
                            round_num: int) -> bool:
         """Let the LLM decide whether the report is comprehensive enough."""
-        prompt = STOP_PROMPT.format(
-            question=question,
-            report=report,
-            round_num=round_num,
+        def _build_prompt(report_text: str) -> str:
+            return STOP_PROMPT.format(
+                question=question,
+                report=report_text,
+                round_num=round_num,
+            )
+
+        report_for_prompt = self._fit_text_for_prompt(
+            report,
+            _build_prompt,
+            requested_output=128,
+            warning_key="stop-report-trim",
+            warning_message="The evolving report was trimmed for the stop decision.",
         )
+        prompt = _build_prompt(report_for_prompt)
 
         try:
             response = await self._llm(
@@ -724,13 +795,25 @@ class DeepResearcher:
     # ------------------------------------------------------------------
     async def _final_report(self, question: str, report: str) -> str:
         """LLM writes a polished final report, retrying if too short."""
-        prompt = FINAL_REPORT_PROMPT.format(
-            question=question,
-            report=report,
-        )
         cat_extra = CATEGORY_PROMPTS.get(self.category or "", "")
-        if cat_extra:
-            prompt += "\n\n" + cat_extra
+
+        def _build_prompt(report_text: str) -> str:
+            prompt_text = FINAL_REPORT_PROMPT.format(
+                question=question,
+                report=report_text,
+            )
+            if cat_extra:
+                prompt_text += "\n\n" + cat_extra
+            return prompt_text
+
+        report_for_prompt = self._fit_text_for_prompt(
+            report,
+            _build_prompt,
+            requested_output=self.max_report_tokens,
+            warning_key="final-report-trim",
+            warning_message="The evolving report was trimmed before final report generation.",
+        )
+        prompt = _build_prompt(report_for_prompt)
 
         try:
             result = await self._llm(
@@ -773,11 +856,244 @@ class DeepResearcher:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    async def _configure_runtime_capabilities(self):
+        """Probe active model limits and adapt research throughput."""
+        try:
+            capabilities = await asyncio.to_thread(
+                get_runtime_capabilities, self.llm_endpoint, self.llm_model,
+            )
+        except Exception as exc:
+            logger.warning("Could not detect research runtime capabilities: %s", exc)
+            return
+
+        self.runtime_context_tokens = max(
+            1, int(capabilities.get("context_length") or 0),
+        )
+        self.safe_context_tokens = max(1, int(self.runtime_context_tokens * 0.9))
+        self.runtime_slots = capabilities.get("parallel_slots")
+        self.runtime_source = capabilities.get("source") or "unknown"
+        logger.info(
+            "Research runtime: context=%s safe=%s slots=%s source=%s",
+            self.runtime_context_tokens,
+            self.safe_context_tokens,
+            self.runtime_slots,
+            self.runtime_source,
+        )
+
+        if self.runtime_slots and self.extraction_concurrency > self.runtime_slots:
+            requested = self.extraction_concurrency
+            self.extraction_concurrency = self.runtime_slots
+            self._warn_adaptive(
+                "concurrency-clamp",
+                f"Extraction concurrency was reduced from {requested} to "
+                f"{self.runtime_slots} to match the model server's available slots.",
+            )
+        if self.runtime_context_tokens <= 8192:
+            slot_text = (
+                f"{self.runtime_slots} slot(s)" if self.runtime_slots else "unknown slot capacity"
+            )
+            self._warn_adaptive(
+                "low-runtime-context",
+                f"Detected a limited {self.runtime_context_tokens}-token model context "
+                f"with {slot_text}; prompts and report length will be reduced as needed.",
+            )
+
+    def _input_budget_for(self, requested_output: int) -> Optional[int]:
+        safe_context = int(getattr(self, "safe_context_tokens", 0) or 0)
+        if not safe_context:
+            return None
+        reserve = min(
+            max(1, int(requested_output or 1)),
+            max(256, safe_context // 3),
+        )
+        return max(1, safe_context - reserve)
+
+    def _fit_text_for_prompt(
+        self,
+        text: str,
+        prompt_builder: Callable[[str], str],
+        requested_output: int,
+        warning_key: str,
+        warning_message: str,
+    ) -> str:
+        """Fit one variable prompt section while preserving its boundaries."""
+        input_budget = self._input_budget_for(requested_output)
+        if not input_budget or not text:
+            return text
+        prompt = prompt_builder(text)
+        if estimate_tokens([{"role": "user", "content": prompt}]) <= input_budget:
+            return text
+
+        fixed_prompt = prompt_builder("")
+        fixed_tokens = estimate_tokens([{"role": "user", "content": fixed_prompt}])
+        available_chars = max(0, int((input_budget - fixed_tokens) / 0.3))
+        fitted = self._trim_text_middle(text, available_chars)
+        if fitted != text:
+            self._warn_adaptive(warning_key, warning_message)
+        return fitted
+
+    def _build_synthesis_prompt(
+        self, question: str, current_report: str, findings: List[Dict],
+    ) -> str:
+        """Fit synthesis inputs, preferring recent findings and report edges."""
+        findings_text = self._format_findings(findings)
+
+        def _build(report_text: str, new_findings: str) -> str:
+            return SYNTHESIZE_PROMPT.format(
+                question=question,
+                report=report_text or "(First round — no report yet.)",
+                new_findings=new_findings,
+            )
+
+        prompt = _build(current_report, findings_text)
+        input_budget = self._input_budget_for(self.max_report_tokens)
+        if not input_budget or estimate_tokens([{"role": "user", "content": prompt}]) <= input_budget:
+            return prompt
+
+        fixed_tokens = estimate_tokens([{"role": "user", "content": _build("", "")}])
+        variable_chars = max(0, int((input_budget - fixed_tokens) / 0.3))
+        report_share = int(variable_chars * (0.4 if current_report else 0.1))
+        findings_share = max(0, variable_chars - report_share)
+        fitted_report = self._trim_text_middle(current_report, report_share)
+        fitted_findings = self._format_recent_findings(findings, findings_share)
+        self._warn_adaptive(
+            "synthesis-input-trim",
+            "Synthesis inputs were reduced to fit the model context; recent findings were prioritized.",
+        )
+        return _build(fitted_report, fitted_findings)
+
+    def _format_recent_findings(self, findings: List[Dict], max_chars: int) -> str:
+        """Format as many newest findings as fit in max_chars."""
+        if not findings or max_chars <= 0:
+            return ""
+        selected: List[Dict] = []
+        for finding in reversed(findings):
+            candidate = [finding] + selected
+            text = self._format_findings(candidate)
+            if selected and len(text) > max_chars:
+                break
+            selected = candidate
+        return self._trim_text_middle(self._format_findings(selected), max_chars)
+
+    def _fit_messages_to_input_budget(
+        self, messages: List[Dict], input_budget: int,
+    ) -> Tuple[List[Dict], bool]:
+        """Trim string message bodies to an estimated input-token budget."""
+        fitted = [dict(message) for message in messages]
+        if estimate_tokens(fitted) <= input_budget:
+            return fitted, False
+
+        string_indexes = [
+            index for index, message in enumerate(fitted)
+            if isinstance(message.get("content"), str)
+        ]
+        if not string_indexes:
+            return fitted, False
+
+        overhead = 4 * len(fitted)
+        char_budget = max(0, int((input_budget - overhead) / 0.3))
+        lengths = [len(fitted[index]["content"]) for index in string_indexes]
+        allocations = self._allocate_char_budget(lengths, char_budget)
+        for index, allocation in zip(string_indexes, allocations):
+            fitted[index]["content"] = self._trim_text_middle(
+                fitted[index]["content"], allocation,
+            )
+        return fitted, True
+
+    @staticmethod
+    def _allocate_char_budget(lengths: List[int], char_budget: int) -> List[int]:
+        if not lengths:
+            return []
+        if sum(lengths) <= char_budget:
+            return list(lengths)
+
+        base = min(512, char_budget // len(lengths))
+        allocations = [min(length, base) for length in lengths]
+        remaining = max(0, char_budget - sum(allocations))
+        extras = [max(0, length - allocation) for length, allocation in zip(lengths, allocations)]
+        while remaining and any(extras):
+            total_extra = sum(extras)
+            distributed = 0
+            for index, extra in enumerate(extras):
+                if not extra:
+                    continue
+                share = max(1, int(remaining * extra / total_extra))
+                share = min(share, extra, remaining - distributed)
+                allocations[index] += share
+                extras[index] -= share
+                distributed += share
+                if distributed >= remaining:
+                    break
+            if not distributed:
+                break
+            remaining -= distributed
+        return allocations
+
+    @staticmethod
+    def _trim_text_middle(text: str, max_chars: int) -> str:
+        """Keep the beginning and end of text when it must be shortened."""
+        text = text or ""
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= 0:
+            return ""
+        marker = "\n[... content trimmed to fit model context ...]\n"
+        if max_chars <= len(marker) + 2:
+            return text[:max_chars]
+        remaining = max_chars - len(marker)
+        head = remaining // 2
+        tail = remaining - head
+        return text[:head] + marker + text[-tail:]
+
+    def _warn_adaptive(self, key: str, message: str):
+        warning_keys = getattr(self, "_adaptive_warning_keys", None)
+        if warning_keys is None:
+            self._adaptive_warning_keys = set()
+            warning_keys = self._adaptive_warning_keys
+        if key in warning_keys:
+            return
+        warning_keys.add(key)
+        warnings = getattr(self, "adaptive_warnings", None)
+        if warnings is None:
+            self.adaptive_warnings = []
+            warnings = self.adaptive_warnings
+        warnings.append(message)
+        logger.warning(message)
+        self._emit(phase="warning", message=message)
+
+    def _with_adaptive_warnings(self, report: str) -> str:
+        warnings = getattr(self, "adaptive_warnings", None) or []
+        if not warnings:
+            return report
+        notice = "> **Research limitations:** " + " ".join(warnings)
+        return f"{notice}\n\n{report}"
+
+    def _no_findings_report(self) -> str:
+        details = []
+        if getattr(self, "_last_llm_error", ""):
+            details.append(f"Model error: {self._last_llm_error}")
+        if getattr(self, "_last_search_error", ""):
+            details.append(f"Search error: {self._last_search_error}")
+        runtime = int(getattr(self, "runtime_context_tokens", 0) or 0)
+        if runtime:
+            details.append(
+                f"Detected model runtime: {runtime} context tokens, "
+                f"{self.runtime_slots or 'unknown'} parallel slot(s)."
+            )
+        reason = "\n\n".join(details) or "No pages produced usable extracted findings."
+        return (
+            "## Research could not produce usable findings\n\n"
+            f"{reason}\n\n"
+            "Check the research model endpoint, its served context size, and the "
+            "configured search provider, then retry."
+        )
+
     def _emit(self, **kwargs):
         """Send a progress event via the callback, if one is registered."""
-        if self._progress:
+        progress = getattr(self, "_progress", None)
+        if progress:
             try:
-                self._progress(kwargs)
+                progress(kwargs)
             except Exception:
                 pass
 
@@ -910,6 +1226,10 @@ class DeepResearcher:
             "URLs": len(self.urls_fetched),
             "Model": self.llm_model,
         }
+        if self.runtime_context_tokens:
+            stats["Context"] = f"{self.runtime_context_tokens} tokens"
+        if self.runtime_slots:
+            stats["Slots"] = self.runtime_slots
         if self.providers_used:
             stats["Search"] = ", ".join(self.providers_used)
         if self.category:

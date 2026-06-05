@@ -6,8 +6,10 @@ Provides token estimation for context usage tracking.
 """
 
 import logging
+import ipaddress
+import socket
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 from urllib.parse import urlparse
 
@@ -20,6 +22,14 @@ _PRIVATE_PREFIXES = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
                      "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
                      "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
                      "172.30.", "172.31.", "192.168.", "100.")
+
+
+class RuntimeCapabilities(TypedDict):
+    """Capabilities exposed by the model's active serving runtime."""
+
+    context_length: int
+    parallel_slots: Optional[int]
+    source: str
 
 
 def _normalize_base_for_compare(url: str) -> str:
@@ -73,8 +83,31 @@ def _is_local_endpoint(url: str) -> bool:
         return True
     try:
         host = urlparse(url).hostname or ""
-        return host in _LOCAL_HOSTS or host.startswith(_PRIVATE_PREFIXES)
+        if host in _LOCAL_HOSTS or _is_private_address(host):
+            return True
+        # Docker service names such as ``llama-hermes`` are not IP-shaped.
+        # Resolve them and treat the endpoint as local only when DNS returns a
+        # private address. Explicit API/proxy endpoint kinds above still win.
+        for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+            address = info[4][0]
+            if _is_private_address(address):
+                return True
+        return False
     except Exception:
+        return False
+
+
+def _is_private_address(value: str) -> bool:
+    """Return whether a hostname/IP literal is local, private, or Tailscale."""
+    if not value:
+        return False
+    value = value.split("%", 1)[0]
+    if value.startswith(_PRIVATE_PREFIXES):
+        return True
+    try:
+        address = ipaddress.ip_address(value)
+        return address.is_private or address.is_loopback or address.is_link_local
+    except ValueError:
         return False
 
 # ---------------------------------------------------------------------------
@@ -238,6 +271,66 @@ def get_context_length(endpoint_url: str, model: str) -> int:
     return ctx
 
 
+def get_runtime_capabilities(endpoint_url: str, model: str) -> RuntimeCapabilities:
+    """Discover the active serving context and parallel request capacity.
+
+    llama.cpp's ``/slots`` response is preferred because it reports the
+    runtime's actual ``--ctx-size`` and ``--parallel`` values. Other endpoints
+    fall back to model API metadata, known model limits, then DEFAULT_CONTEXT.
+    """
+    known = _lookup_known(model)
+    configured_kind = _configured_endpoint_kind(endpoint_url)
+    is_local = _is_local_endpoint(endpoint_url)
+
+    if configured_kind in ("api", "proxy"):
+        return {
+            "context_length": known or DEFAULT_CONTEXT,
+            "parallel_slots": None,
+            "source": "known model" if known else "default",
+        }
+
+    if is_local:
+        slots = _query_llama_slots(endpoint_url)
+        if slots:
+            contexts = [
+                slot.get("n_ctx") for slot in slots
+                if isinstance(slot, dict)
+                and isinstance(slot.get("n_ctx"), int)
+                and slot.get("n_ctx") > 0
+            ]
+            if contexts:
+                context_length = min(contexts)
+                logger.info(
+                    "llama.cpp /slots reports n_ctx=%s and %s slot(s) for %s",
+                    context_length, len(slots), model,
+                )
+                return {
+                    "context_length": context_length,
+                    "parallel_slots": len(slots),
+                    "source": "llama.cpp /slots",
+                }
+
+    api_ctx = _query_models_context(endpoint_url, model)
+    if api_ctx and known:
+        if is_local and api_ctx < known:
+            logger.info(
+                "Local endpoint reports %s for %s (known max: %s) - using API value",
+                api_ctx, model, known,
+            )
+            context_length = api_ctx
+        else:
+            context_length = max(api_ctx, known)
+    else:
+        context_length = api_ctx or known or DEFAULT_CONTEXT
+
+    source = "model API" if api_ctx else ("known model" if known else "default")
+    return {
+        "context_length": context_length,
+        "parallel_slots": None,
+        "source": source,
+    }
+
+
 def _lookup_known(model: str) -> Optional[int]:
     """Check known context windows by substring match.
 
@@ -259,43 +352,40 @@ def _lookup_known(model: str) -> Optional[int]:
 
 def _query_context_length(endpoint_url: str, model: str) -> int:
     """Query the model API for context length."""
-    known = _lookup_known(model)
+    return get_runtime_capabilities(endpoint_url, model)["context_length"]
+
+
+def _endpoint_root(endpoint_url: str) -> str:
+    """Return the server root for an OpenAI-compatible endpoint URL."""
+    endpoint_url = (endpoint_url or "").strip().rstrip("/")
+    if "/v1" in endpoint_url:
+        return endpoint_url.split("/v1", 1)[0]
+    return _normalize_base_for_compare(endpoint_url)
+
+
+def _query_llama_slots(endpoint_url: str) -> Optional[List[Dict]]:
+    try:
+        response = httpx.get(f"{_endpoint_root(endpoint_url)}/slots", timeout=REQUEST_TIMEOUT)
+        slots = response.json() if response.is_success else None
+        return slots if isinstance(slots, list) and slots else None
+    except Exception as exc:
+        logger.debug("Failed to query llama.cpp slots: %s", exc)
+        return None
+
+
+def _query_models_context(endpoint_url: str, model: str) -> Optional[int]:
+    """Read context metadata for one model from an OpenAI-compatible API."""
     api_ctx = None
-    configured_kind = _configured_endpoint_kind(endpoint_url)
 
-    # Large OpenAI-compatible proxies can make /models expensive. If the
-    # endpoint is explicitly configured as API/proxy, prefer known context
-    # metadata (or the default) over downloading the full catalog.
-    if configured_kind in ("api", "proxy"):
-        if known:
-            logger.info(f"Using known context window for {model}: {known}")
-            return known
-        return DEFAULT_CONTEXT
-
-    # Try llama.cpp /slots endpoint first — reports actual serving context
-    if _is_local_endpoint(endpoint_url):
-        try:
-            base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
-            r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
-            if r.is_success:
-                slots = r.json()
-                if isinstance(slots, list) and slots:
-                    n_ctx = slots[0].get("n_ctx")
-                    if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
-                        logger.info(f"llama.cpp /slots reports n_ctx={n_ctx} for {model}")
-                        return n_ctx
-        except Exception:
-            pass
-
-    # GitHub Copilot's /models requires auth + X-GitHub-Api-Version headers that
-    # aren't available here; an unauthenticated probe just 400s. All Copilot
-    # picker models are major API models covered by the known-context table, so
-    # rely on that instead of a doomed network call.
-    from src.copilot import is_copilot_base
-    if is_copilot_base(endpoint_url):
-        if known:
-            logger.info(f"Using known context window for {model}: {known}")
-        return known or DEFAULT_CONTEXT
+    # GitHub Copilot's /models endpoint needs special auth headers. If this is
+    # a Copilot base URL, skip probing and let get_runtime_capabilities() fall
+    # back to known model metadata/defaults.
+    try:
+        from src.copilot import is_copilot_base
+        if is_copilot_base(endpoint_url):
+            return None
+    except Exception:
+        pass
 
     models_url = endpoint_url.replace("/chat/completions", "/models")
     try:
@@ -331,25 +421,7 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
                     break
     except Exception as e:
         logger.debug(f"Failed to query context length for {model}: {e}")
-
-    # For local/self-hosted endpoints, trust the API value (user set --max-model-len)
-    # For cloud APIs, use the larger value (API can report low defaults)
-    if api_ctx and known:
-        _is_local = _is_local_endpoint(endpoint_url)
-        if _is_local and api_ctx < known:
-            logger.info(f"Local endpoint reports {api_ctx} for {model} (known max: {known}) — using API value")
-            return api_ctx
-        result = max(api_ctx, known)
-        if api_ctx < known:
-            logger.info(f"API reported {api_ctx} for {model}, using known {known} instead")
-        return result
-    if api_ctx:
-        return api_ctx
-    if known:
-        logger.info(f"Using known context window for {model}: {known}")
-        return known
-
-    return DEFAULT_CONTEXT
+    return api_ctx
 
 
 def estimate_tokens(messages: List[Dict]) -> int:

@@ -95,6 +95,17 @@ class TestIsLocalEndpoint:
     def test_malformed_url(self):
         assert _is_local_endpoint("not-a-url") is False
 
+    def test_docker_service_hostname_resolving_private_is_local(self, monkeypatch):
+        monkeypatch.setattr(
+            model_context.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: [
+                (model_context.socket.AF_INET, model_context.socket.SOCK_STREAM, 6, "", ("172.20.0.4", 0))
+            ],
+        )
+
+        assert _is_local_endpoint("http://llama-hermes:8000/v1/chat/completions") is True
+
 
 class TestEstimateTokens:
     def test_empty_list(self):
@@ -249,3 +260,45 @@ class TestGetContextLength:
         assert first == model_context.DEFAULT_CONTEXT
         assert second == model_context.DEFAULT_CONTEXT
         assert calls == []
+
+
+class TestRuntimeCapabilities:
+    def test_llama_slots_override_known_model_context(self, monkeypatch):
+        monkeypatch.setattr(model_context, "_is_local_endpoint", lambda url: True)
+
+        class _Response:
+            is_success = True
+
+            def json(self):
+                return [{"id": 0, "n_ctx": 4096}]
+
+        monkeypatch.setattr(model_context.httpx, "get", lambda *args, **kwargs: _Response())
+
+        capabilities = model_context.get_runtime_capabilities(
+            "http://llama-hermes:8000/v1/chat/completions",
+            "Hermes-2-Pro-Mistral-7B.Q6_K.gguf",
+        )
+
+        assert capabilities == {
+            "context_length": 4096,
+            "parallel_slots": 1,
+            "source": "llama.cpp /slots",
+        }
+
+    def test_slot_count_reports_parallel_capacity(self, monkeypatch):
+        monkeypatch.setattr(model_context, "_is_local_endpoint", lambda url: True)
+
+        class _Response:
+            is_success = True
+
+            def json(self):
+                return [{"id": 0, "n_ctx": 8192}, {"id": 1, "n_ctx": 8192}]
+
+        monkeypatch.setattr(model_context.httpx, "get", lambda *args, **kwargs: _Response())
+
+        capabilities = model_context.get_runtime_capabilities(
+            "http://llama:8000/v1/chat/completions", "local-model",
+        )
+
+        assert capabilities["context_length"] == 8192
+        assert capabilities["parallel_slots"] == 2

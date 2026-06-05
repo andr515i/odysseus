@@ -67,6 +67,9 @@ services:
       chromadb:
         condition: service_started
     restart: unless-stopped
+    networks:
+      default:
+      odysseus-llm:
 
   chromadb:
     image: docker.io/chromadb/chroma:latest
@@ -143,3 +146,7 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+
+networks:
+  odysseus-llm:
+    external: true

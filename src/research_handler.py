@@ -325,11 +325,18 @@ class ResearchHandler:
                 entry["status"] = "error"
                 # If we have partial results, save what we have
                 researcher = entry.get("researcher")
-                if researcher and researcher.evolving_report:
+                partial_report = researcher.evolving_report if researcher else ""
+                if researcher and not partial_report and researcher.findings:
+                    partial_report = researcher._fallback_report(query, researcher.findings)
+                    partial_report = researcher._with_adaptive_warnings(partial_report)
+                    researcher.evolving_report = partial_report
+                if researcher and partial_report:
+                    stats = researcher.get_stats()
                     entry["result"] = self._format_research_report(
-                        query, researcher.evolving_report,
-                        researcher.get_stats(), hard_timeout,
+                        query, partial_report, stats, hard_timeout,
                     )
+                    entry["raw_report"] = strip_thinking(partial_report)
+                    entry["stats"] = stats
                     entry["status"] = "done"
                     self._save_result(session_id, entry)
                     try:
@@ -828,6 +835,10 @@ class ResearchHandler:
             f"**Queries:** {stats.get('Queries', stats.get('Searches', '?'))}",
             f"**URLs Analyzed:** {stats.get('URLs', '?')}",
         ]
+        if stats.get("Context"):
+            summary_lines.append(f"**Context:** {stats['Context']}")
+        if stats.get("Slots"):
+            summary_lines.append(f"**Slots:** {stats['Slots']}")
         summary_text = " | ".join(summary_lines)
 
         formatted = f"""---

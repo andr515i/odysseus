@@ -98,7 +98,7 @@ DEFAULT_SETTINGS = {
     # for very long deep-research runs, since a stalled job then runs an
     # unbounded model/API bill. Other values are bounded to [60, 86400].
     # Tune via Settings or by editing data/settings.json.
-    "research_run_timeout_seconds": 1800,
+    "research_run_timeout_seconds": 2700,
     "agent_max_tool_calls": 0,
     "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
     "agent_input_token_budget": 6000,
