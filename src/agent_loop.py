@@ -211,9 +211,9 @@ Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check ex
 
     "ask_user": """\
 ```ask_user
-{"question": "<clarifying question>", "choices": [{"label": "<option>", "value": "<answer>"}], "allow_free_text": true}
+{"question": "<clarifying question>", "choices": [{"label": "Minimal", "value": "minimal"}, {"label": "Robust", "value": "robust"}], "allow_free_text": true}
 ```
-Pause planning and ask the user for a needed clarification or decision. Use this only when continuing would require guessing about the user's intent, scope, or approval. The run ends after this event; the user's answer will arrive as the next message in the same session context.""",
+Pause planning and ask the user for a needed clarification or decision. If the question has obvious discrete options, prefer the structured `choices` shape above so the UI can render buttons. Plain `ask_user("...")` is acceptable only when there are no obvious discrete options. Use this only when continuing would require guessing about the user's intent, scope, or approval. The run ends after this event; the user's answer will arrive as the next message in the same session context.""",
 
     "read_file": """\
 ```read_file

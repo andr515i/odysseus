@@ -410,7 +410,11 @@ const TOOL_CALL_RE = /\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/gi;
 const EXEC_FENCE_RE = /```(?:web_search|web_fetch|ask_user|read_file|write_file|create_document|edit_document|update_document)\s*\n[\s\S]*?```/gi;
 // XML-style tool calls: <minimax:tool_call>, <tool_call>, <function_call>, bare <invoke>
 const XML_TOOL_CALL_RE = /<(?:[\w]+:)?(?:tool_call|function_call)>[\s\S]*?<\/(?:[\w]+:)?(?:tool_call|function_call)>/gi;
+const XML_INVOKE_TOOL_RE = /<invoke_tool>[\s\S]*?<\/invoke_tool>/gi;
 const XML_INVOKE_RE = /<invoke\s+name=['"][^'"]*['"]>[\s\S]*?<\/invoke>/gi;
+const ANY_FENCE_RE = /```[^\n`]*\n([\s\S]*?)```/g;
+const DIRECT_ASK_CALL_RE = /^\s*(?:ask_user|ask|clarify)\s*\(\s*(?:(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|question\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\{(?=[^\n]*"question"\s*:)[^\n]*\})\s*\)\s*$/i;
+const ASK_JSON_TOOL_NAMES = new Set(['ask_user', 'ask', 'clarify', 'clarification']);
 // DeepSeek "DSML" tool-call markup (fullwidth-pipe ｜ or ascii | delimited) that
 // leaks into content when the model emits a text tool call instead of a native
 // one. Strip the whole block; the second pattern catches stray/partial tags
@@ -419,6 +423,61 @@ const DSML_TOOL_RE = /<\s*[｜|]+\s*DSML\s*[｜|]+\s*tool_calls\s*>[\s\S]*?(?:<\
 const DSML_STRAY_RE = /<\s*\/?\s*[｜|]+\s*DSML\s*[｜|]+[^>]*>/gi;
 // Self-narration about tool results (model echoing stdout/exit_code)
 const TOOL_NARRATION_RE = /(?:The (?:result|output) shows?:?\s*)?-?\s*(?:stdout|stderr|exit_code):\s*.+/gi;
+
+
+function isDirectAskCall(text) {
+  const s = String(text || '').trim();
+  return s && !/[\r\n]/.test(s) && DIRECT_ASK_CALL_RE.test(s);
+}
+
+function isPlainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function askJsonArgs(payload) {
+  if (!isPlainObject(payload)) return null;
+  const toolName = String(payload.tool || payload.name || payload.function || payload.tool_name || '').trim().toLowerCase().replace(/-/g, '_');
+  if (!ASK_JSON_TOOL_NAMES.has(toolName)) return null;
+
+  let source = payload;
+  if (isPlainObject(payload.arguments)) source = payload.arguments;
+  else if (isPlainObject(payload.args)) source = payload.args;
+
+  const question = source.question ?? source.message ?? source.prompt ?? source.text;
+  return typeof question === 'string' ? source : null;
+}
+
+function isBareAskJson(text) {
+  const s = String(text || '').trim();
+  if (!s.startsWith('{') || !s.endsWith('}')) return false;
+  try {
+    return Boolean(askJsonArgs(JSON.parse(s)));
+  } catch (_) {
+    return false;
+  }
+}
+
+function stripDirectAskFences(text) {
+  return String(text || '').replace(ANY_FENCE_RE, (match, body) => (
+    isDirectAskCall(body) || isBareAskJson(body) ? '' : match
+  ));
+}
+
+function stripStandaloneDirectAskLines(text) {
+  const lines = String(text || '').match(/[^\n]*\n|[^\n]+/g) || [];
+  let inFence = false;
+  const kept = [];
+  for (const line of lines) {
+    if (/^[ \t]*```/.test(line)) {
+      inFence = !inFence;
+      kept.push(line);
+      continue;
+    }
+    if (!inFence && isDirectAskCall(line)) continue;
+    kept.push(line);
+  }
+  return kept.join('');
+}
 
 
 // Model pricing table — per million tokens
@@ -793,13 +852,17 @@ export function roleTimestamp(when) {
  * Strip tool invocation blocks from text before rendering.
  */
 export function stripToolBlocks(text) {
-  let cleaned = text.replace(TOOL_CALL_RE, '');
+  let cleaned = stripDirectAskFences(text);
+  cleaned = cleaned.replace(TOOL_CALL_RE, '');
   cleaned = cleaned.replace(EXEC_FENCE_RE, '');
   cleaned = cleaned.replace(DSML_TOOL_RE, '');
   cleaned = cleaned.replace(DSML_STRAY_RE, '');
+  cleaned = cleaned.replace(XML_INVOKE_TOOL_RE, '');
   cleaned = cleaned.replace(XML_TOOL_CALL_RE, '');
   cleaned = cleaned.replace(XML_INVOKE_RE, '');
   cleaned = cleaned.replace(TOOL_NARRATION_RE, '');
+  cleaned = stripStandaloneDirectAskLines(cleaned);
+  if (isBareAskJson(cleaned)) cleaned = '';
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
   return cleaned.trim();
 }
@@ -1273,9 +1336,10 @@ function _submitAssistantQuestionAnswer(card, answer) {
   if (card) card.dataset.submitting = 'true';
   _markAssistantQuestionAnswered(card);
   const questionText = card?.querySelector('.assistant-question-text')?.textContent?.trim();
+  const continuationInstruction = 'Use this answer to continue the previous user request. Do not invent a new task. Do not create files, run tools, or implement anything unless the previous user request explicitly asked for that.';
   msgInput.value = questionText
-    ? `Answer to your question: ${clean}\n\nQuestion I am answering: ${questionText}\n\nContinue from the plan you were building.`
-    : `Answer to your question: ${clean}\n\nContinue from the plan you were building.`;
+    ? `Answer to your question: ${clean}\n\nQuestion I am answering: ${questionText}\n\n${continuationInstruction}`
+    : `Answer to your question: ${clean}\n\n${continuationInstruction}`;
   msgInput.dispatchEvent(new Event('input', { bubbles: true }));
   msgInput.focus();
 

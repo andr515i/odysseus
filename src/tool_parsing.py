@@ -8,6 +8,7 @@ Supports fenced code blocks, [TOOL_CALL] blocks, and XML-style <invoke> blocks.
 import re
 import json
 import logging
+import ast
 from typing import List, Optional
 
 from src.agent_tools import ToolBlock, TOOL_TAGS
@@ -23,6 +24,13 @@ _TOOL_BLOCK_RE = re.compile(
     r"```(" + "|".join(TOOL_TAGS) + r")\s*\n([\s\S]*?)```",
     re.IGNORECASE,
 )
+
+_ANY_FENCE_RE = re.compile(
+    r"```[^\n`]*\n([\s\S]*?)```",
+    re.IGNORECASE,
+)
+
+_FENCE_LINE_RE = re.compile(r"^[ \t]*```")
 
 # Pattern 2: [TOOL_CALL] ... [/TOOL_CALL] blocks (some models use this format)
 # Matches: {tool => "shell", args => {--command "ls -la"}} etc.
@@ -42,6 +50,12 @@ _XML_INVOKE_RE = re.compile(
     r'<invoke\s+name=["\'](\w+)["\']>\s*([\s\S]*?)</invoke>',
     re.IGNORECASE,
 )
+
+_XML_INVOKE_TOOL_RE = re.compile(
+    r"<invoke_tool>\s*([\s\S]*?)</invoke_tool>",
+    re.IGNORECASE,
+)
+
 _XML_PARAM_RE = re.compile(
     r'<parameter\s+name=["\'](\w+)["\']>([\s\S]*?)</parameter>',
     re.IGNORECASE,
@@ -51,6 +65,13 @@ _XML_PARAM_RE = re.compile(
 # {tool => 'tool_name', args => '<param>value</param>'}
 _TOOL_CODE_RE = re.compile(
     r"<tool_code>\s*\{([\s\S]*?)\}\s*</tool_code>",
+    re.IGNORECASE,
+)
+
+_DIRECT_ASK_NAMES = {"ask_user", "ask", "clarify"}
+_JSON_ASK_NAMES = _DIRECT_ASK_NAMES | {"clarification"}
+_DIRECT_ASK_CALL_RE = re.compile(
+    r"^\s*(ask_user|ask|clarify)\s*\(([\s\S]*)\)\s*$",
     re.IGNORECASE,
 )
 
@@ -185,6 +206,163 @@ _TOOL_NAME_MAP = {
 # ---------------------------------------------------------------------------
 # Parsing functions
 # ---------------------------------------------------------------------------
+
+def _literal_str(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _direct_ask_args(raw: str) -> Optional[dict]:
+    """Return ask_user args for one exact direct ask call, or None."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or "\n" in text or "\r" in text:
+        return None
+
+    m = _DIRECT_ASK_CALL_RE.match(text)
+    if not m or m.group(1).lower() not in _DIRECT_ASK_NAMES:
+        return None
+
+    arg_src = m.group(2).strip()
+    if not arg_src:
+        return None
+
+    if arg_src.startswith("{") and arg_src.endswith("}"):
+        try:
+            payload = json.loads(arg_src)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict) and isinstance(payload.get("question"), str):
+            return payload
+        return None
+
+    try:
+        expr = ast.parse(text, mode="eval").body
+    except SyntaxError:
+        return None
+
+    if not isinstance(expr, ast.Call):
+        return None
+    if not isinstance(expr.func, ast.Name) or expr.func.id.lower() not in _DIRECT_ASK_NAMES:
+        return None
+
+    if len(expr.args) == 1 and not expr.keywords:
+        question = _literal_str(expr.args[0])
+        return {"question": question} if question is not None else None
+
+    if not expr.args and len(expr.keywords) == 1 and expr.keywords[0].arg == "question":
+        question = _literal_str(expr.keywords[0].value)
+        return {"question": question} if question is not None else None
+
+    return None
+
+
+def _normalize_ask_json_payload(payload: object) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+
+    raw_tool = (
+        payload.get("tool")
+        or payload.get("name")
+        or payload.get("function")
+        or payload.get("tool_name")
+    )
+    tool_name = str(raw_tool or "").strip().lower().replace("-", "_")
+    if tool_name not in _JSON_ASK_NAMES:
+        return None
+
+    source = None
+    if isinstance(payload.get("arguments"), dict):
+        source = payload["arguments"]
+    elif isinstance(payload.get("args"), dict):
+        source = payload["args"]
+    else:
+        source = payload
+
+    args = dict(source)
+    if "question" not in args:
+        for key in ("message", "prompt", "text"):
+            if key in args:
+                args["question"] = args[key]
+                break
+    if "choices" not in args and "options" in args:
+        args["choices"] = args["options"]
+
+    if not isinstance(args.get("question"), str):
+        return None
+    return args
+
+
+def _bare_json_ask_args(raw: str) -> Optional[dict]:
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text.startswith("{") or not text.endswith("}"):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return _normalize_ask_json_payload(payload)
+
+
+def _ask_args_to_tool_block(args: Optional[dict]) -> Optional[ToolBlock]:
+    if args is None:
+        return None
+    from src.tool_schemas import function_call_to_tool_block
+    return function_call_to_tool_block("ask_user", json.dumps(args))
+
+
+def _parse_direct_ask_call(raw: str) -> Optional[ToolBlock]:
+    return _ask_args_to_tool_block(_direct_ask_args(raw))
+
+
+def _parse_ask_compat_block(raw: str) -> Optional[ToolBlock]:
+    args = _direct_ask_args(raw)
+    if args is None:
+        args = _bare_json_ask_args(raw)
+    return _ask_args_to_tool_block(args)
+
+
+def _span_overlaps(span, spans) -> bool:
+    start, end = span
+    return any(start < other_end and end > other_start for other_start, other_end in spans)
+
+
+def _strip_ask_compat_fences(text: str) -> str:
+    def repl(match) -> str:
+        body = match.group(1).strip()
+        return "" if (_direct_ask_args(body) is not None or _bare_json_ask_args(body) is not None) else match.group(0)
+
+    return _ANY_FENCE_RE.sub(repl, text)
+
+
+def _strip_standalone_direct_ask_lines(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    in_fence = False
+    kept = []
+    for line in lines:
+        if _FENCE_LINE_RE.match(line):
+            kept.append(line)
+            in_fence = not in_fence
+            continue
+        if not in_fence and _direct_ask_args(line.strip()) is not None:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _iter_lines_outside_fences(text: str):
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_LINE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            yield line
+
 
 def _parse_tool_call_block(raw: str) -> Optional[ToolBlock]:
     """Parse a [TOOL_CALL] block into a ToolBlock.
@@ -343,6 +521,8 @@ def parse_tool_blocks(text: str) -> List[ToolBlock]:
     3. XML-style <tool_call>/<invoke> blocks
     4. <tool_code> blocks (MiniMax-M2.5 style)
     5. DeepSeek DSML markup (normalized to <invoke> first)
+    6. Bare JSON ask_user objects
+    7. Standalone direct ask_user(...) calls
     """
     blocks = []
 
@@ -350,8 +530,17 @@ def parse_tool_blocks(text: str) -> List[ToolBlock]:
     # XML patterns below catch it.
     text = _normalize_dsml(text)
 
+    ask_compat_fence_spans = []
+    for m in _ANY_FENCE_RE.finditer(text):
+        block = _parse_ask_compat_block(m.group(1).strip())
+        if block:
+            blocks.append(block)
+            ask_compat_fence_spans.append(m.span())
+
     # Pattern 1: fenced code blocks
     for m in _TOOL_BLOCK_RE.finditer(text):
+        if _span_overlaps(m.span(), ask_compat_fence_spans):
+            continue
         tag = m.group(1).lower()
         content = m.group(2).strip()
         if not content:
@@ -378,12 +567,20 @@ def parse_tool_blocks(text: str) -> List[ToolBlock]:
 
     # Pattern 3: XML-style <tool_call>/<invoke> blocks
     if not blocks:
+        # Try JSON-style: <invoke_tool>{"name": "...", "arguments": {...}}</invoke_tool>
+        for m in _XML_INVOKE_TOOL_RE.finditer(text):
+            block = _parse_invoke_tool_json(m.group(1))
+            if block:
+                blocks.append(block)
+
         # Try wrapped: <tool_call><invoke ...>...</invoke></tool_call>
-        for m in _XML_TOOL_CALL_RE.finditer(text):
-            for inv in _XML_INVOKE_RE.finditer(m.group(1)):
-                block = _parse_xml_invoke(inv)
-                if block:
-                    blocks.append(block)
+        if not blocks:
+            for m in _XML_TOOL_CALL_RE.finditer(text):
+                for inv in _XML_INVOKE_RE.finditer(m.group(1)):
+                    block = _parse_xml_invoke(inv)
+                    if block:
+                        blocks.append(block)
+
         # Try bare <invoke> without wrapper
         if not blocks:
             for inv in _XML_INVOKE_RE.finditer(text):
@@ -398,6 +595,19 @@ def parse_tool_blocks(text: str) -> List[ToolBlock]:
             if block:
                 blocks.append(block)
 
+    # Pattern 6: Qwen-style bare JSON ask_user object as the whole response
+    if not blocks:
+        block = _parse_ask_compat_block(text)
+        if block:
+            blocks.append(block)
+
+    # Pattern 7: Qwen-style direct ask_user(...) call as a standalone line
+    if not blocks:
+        for line in _iter_lines_outside_fences(text):
+            block = _parse_direct_ask_call(line)
+            if block:
+                blocks.append(block)
+
     return blocks
 
 
@@ -406,11 +616,67 @@ def strip_tool_blocks(text: str) -> str:
     # Normalize DSML first so its markup gets stripped by the <invoke>
     # / <tool_call> removers below instead of leaking to the user.
     text = _normalize_dsml(text)
-    cleaned = _TOOL_BLOCK_RE.sub('', text)
+    cleaned = _strip_ask_compat_fences(text)
+    cleaned = _TOOL_BLOCK_RE.sub('', cleaned)
     cleaned = _TOOL_CALL_RE.sub('', cleaned)
+    cleaned = _XML_INVOKE_TOOL_RE.sub('', cleaned)
     cleaned = _XML_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _TOOL_CODE_RE.sub('', cleaned)
     # Strip bare <invoke> blocks not wrapped in <tool_call>
     cleaned = re.sub(r'<invoke\s+name=["\'].*?</invoke>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = _strip_standalone_direct_ask_lines(cleaned)
+    if _bare_json_ask_args(cleaned) is not None:
+        cleaned = ''
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
+
+
+def _parse_invoke_tool_json(raw: str) -> Optional[ToolBlock]:
+    """Parse <invoke_tool>{...}</invoke_tool> JSON blocks.
+
+    Handles model output like:
+      <invoke_tool>
+      {"name": "ask_user", "arguments": {"question": "..."}}
+      </invoke_tool>
+    """
+    try:
+        payload = json.loads((raw or "").strip())
+    except json.JSONDecodeError as exc:
+        logger.debug("Failed to parse invoke_tool JSON: %s", exc)
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    tool_name = (
+        payload.get("name")
+        or payload.get("tool")
+        or payload.get("tool_name")
+    )
+    if not tool_name:
+        return None
+
+    tool_name = str(tool_name).strip().lower().replace("-", "_")
+    mapped = _TOOL_NAME_MAP.get(tool_name) or (tool_name if tool_name in TOOL_TAGS else tool_name)
+
+    args = payload.get("arguments", payload.get("args", {}))
+    if args is None:
+        args = {}
+
+    # Some models double-encode arguments as a JSON string.
+    if isinstance(args, str):
+        try:
+            parsed_args = json.loads(args)
+            if isinstance(parsed_args, dict):
+                args = parsed_args
+        except json.JSONDecodeError:
+            if mapped == "ask_user":
+                args = {"question": args}
+            else:
+                args = {"input": args}
+
+    if not isinstance(args, dict):
+        args = {"input": str(args)}
+
+    from src.tool_schemas import function_call_to_tool_block
+    return function_call_to_tool_block(mapped, json.dumps(args))

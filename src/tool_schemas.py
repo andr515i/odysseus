@@ -82,14 +82,22 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "ask_user",
-            "description": "Pause planning and ask the user for a needed clarification or decision. Use sparingly when continuing would require guessing.",
+            "description": (
+                "Pause planning and ask the user for a needed clarification or decision. "
+                "When the question has obvious discrete options, provide structured choices "
+                "so the UI can render buttons. Plain ask_user(\"...\") is acceptable only "
+                "when there are no obvious discrete options."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string", "description": "The concise question to ask the user"},
                     "choices": {
                         "type": "array",
-                        "description": "Optional choices to render as buttons",
+                        "description": (
+                            "Structured choices to render as buttons. Prefer this whenever "
+                            "known options exist, e.g. Minimal vs Robust."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {
