@@ -81,6 +81,35 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "ask_user",
+            "description": "Pause planning and ask the user for a needed clarification or decision. Use sparingly when continuing would require guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The concise question to ask the user"},
+                    "choices": {
+                        "type": "array",
+                        "description": "Optional choices to render as buttons",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "value": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    "allow_free_text": {"type": "boolean", "description": "Whether the user may answer with custom text"},
+                    "question_id": {"type": "string", "description": "Optional stable id for this question"},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "Read a file from disk. Optionally read a line range with offset/limit for large files.",
             "parameters": {
@@ -1191,6 +1220,13 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = str(queries)
         else:
             content = args.get("query", "")
+    elif tool_type == "ask_user":
+        content = json.dumps({
+            "question": args.get("question", ""),
+            "choices": args.get("choices") or [],
+            "allow_free_text": args.get("allow_free_text", True),
+            "question_id": args.get("question_id") or "",
+        })
     elif tool_type == "read_file":
         # Plain path (back-compat) unless a line range is requested → JSON.
         if args.get("offset") or args.get("limit"):

@@ -34,6 +34,7 @@ from src.agent_tools import (
     ToolBlock,
     MAX_AGENT_ROUNDS,
 )
+from src.agent_questions import normalize_question_payload
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,12 @@ Search the web for a SINGLE quick fact/lookup mid-task. For news / "today" / "la
 <url or domain>
 ```
 Fetch and read the text content of a SPECIFIC URL the user names (e.g. "check example.com", "what does this page say <url>"). A bare domain like `example.com` works (defaults to https). Use this when you already have a concrete URL. For open-ended lookups use `web_search`, and for "research X" jobs use `trigger_research`.""",
+
+    "ask_user": """\
+```ask_user
+{"question": "<clarifying question>", "choices": [{"label": "<option>", "value": "<answer>"}], "allow_free_text": true}
+```
+Pause planning and ask the user for a needed clarification or decision. Use this only when continuing would require guessing about the user's intent, scope, or approval. The run ends after this event; the user's answer will arrive as the next message in the same session context.""",
 
     "read_file": """\
 ```read_file
@@ -1398,6 +1405,7 @@ async def stream_agent_loop(
       - data: {"type": "tool_start", "tool": "...", ...}    (before execution)
       - data: {"type": "tool_output", "tool": "...", ...}   (after execution)
       - data: {"type": "agent_step", "round": N}            (next round)
+      - data: {"type": "assistant_question", ...}           (waiting for user input)
       - data: {"type": "metrics", "data": {...}}            (final metrics)
       - data: [DONE]                                        (end)
     """
@@ -1989,6 +1997,31 @@ async def stream_agent_loop(
         # Keep <think> blocks so they render in the thinking section on reload
         cleaned_round = strip_tool_blocks(round_response).strip()
         round_texts.append(cleaned_round)
+
+        ask_block = next((b for b in tool_blocks if b.tool_type == "ask_user"), None)
+        if ask_block:
+            question_payload = normalize_question_payload(ask_block.content)
+            logger.info(
+                "Agent round %s: ask_user emitted question_id=%s",
+                round_num,
+                question_payload.get("question_id"),
+            )
+            yield f"data: {json.dumps({'type': 'assistant_question', **question_payload})}\n\n"
+
+            total_duration = time.time() - total_start
+            metrics = _compute_final_metrics(
+                messages, full_response, total_duration, time_to_first_token,
+                context_length, real_input_tokens, real_output_tokens,
+                has_real_usage, tool_events, round_texts, model=model,
+                last_round_input_tokens=last_round_input_tokens,
+                prep_timings=prep_timings,
+                backend_gen_tps=backend_gen_tps,
+                backend_prefill_tps=backend_prefill_tps,
+            )
+            metrics["waiting_for_user"] = True
+            yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
         if not tool_blocks:
             # ── Completion verifier (mechanism 3a) ────────────────────

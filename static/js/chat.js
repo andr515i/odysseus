@@ -172,6 +172,7 @@ import createResearchSynapse from './researchSynapse.js';
   var addMessage = chatRenderer.addMessage;
   var createMsgFooter = chatRenderer.createMsgFooter;
   var displayMetrics = chatRenderer.displayMetrics;
+  var renderAssistantQuestionCard = chatRenderer.renderAssistantQuestionCard;
   var hideWelcomeScreen = chatRenderer.hideWelcomeScreen;
   var showWelcomeScreen = chatRenderer.showWelcomeScreen;
 
@@ -1002,6 +1003,7 @@ import createResearchSynapse from './researchSynapse.js';
       const decoder = new TextDecoder();
       let buffer = '';
       let metrics = null;
+      let assistantQuestionPayload = null;
       let isThinking = false;
       let thinkingStartTime = null;
       // Streaming TTS: synthesize sentence-by-sentence during streaming
@@ -1300,6 +1302,7 @@ import createResearchSynapse from './researchSynapse.js';
                 abortCtrl: currentAbort,
                 query: streamQuery,
                 metrics: null,
+                assistantQuestion: null,
               });
               if (sessionModule && sessionModule.markStreaming) {
                 sessionModule.markStreaming(streamSessionId);
@@ -1387,8 +1390,8 @@ import createResearchSynapse from './researchSynapse.js';
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
               }
-              if (json.delta || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
-                clearResponseTimeout();
+            if (json.delta || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress' || json.type === 'assistant_question') {
+            clearResponseTimeout();
                 clearProcessingProbe();
               }
               if (json.delta) {
@@ -1953,6 +1956,22 @@ import createResearchSynapse from './researchSynapse.js';
                 if (!_isBg) {
                   uiModule.showToast('Context compacted — older messages summarized');
                 }
+              } else if (json.type === 'assistant_question') {
+                assistantQuestionPayload = json;
+                if (_isBg) {
+                  var bgQ = _backgroundStreams.get(streamSessionId);
+                  if (bgQ) bgQ.assistantQuestion = json;
+                  continue;
+                }
+                _cancelThinkingTimer();
+                _removeThinkingSpinner();
+                if (spinner && spinner.element) spinner.destroy();
+                const qBody = roundHolder.querySelector('.body');
+                if (qBody && !qBody.querySelector('.assistant-question-card')) {
+                  qBody.appendChild(renderAssistantQuestionCard(json));
+                }
+                if (roundHolder) roundHolder.classList.remove('streaming');
+                uiModule.scrollHistory();
               } else if (json.type === 'metrics') {
                 metrics = json.data;
                 if (_isBg) {
@@ -2404,7 +2423,10 @@ import createResearchSynapse from './researchSynapse.js';
           _applyModelColor(roleEl, metrics?.model || finalMeta?.model);
           if (tsSpan) roleEl.appendChild(tsSpan);
         }
-        holder.dataset.raw = accumulated;
+        const finalAssistantRaw = assistantQuestionPayload
+          ? (stripToolBlocks(accumulated || '').trim() || assistantQuestionPayload?.question || '')
+          : accumulated;
+        holder.dataset.raw = finalAssistantRaw;
 
         // Anti-stall: a turn that ran tools but ended with essentially no
         // final prose usually means the model stopped mid-task (the case
@@ -2414,7 +2436,7 @@ import createResearchSynapse from './researchSynapse.js';
         try {
           const _usedTools = holder.querySelector('.agent-thread-node');
           const _proseLen = (accumulated || '').replace(/<[^>]*>/g, '').trim().length;
-          if (_usedTools && _proseLen < 24 && !holder.querySelector('.agent-continue-btn')) {
+          if (!assistantQuestionPayload && _usedTools && _proseLen < 24 && !holder.querySelector('.agent-continue-btn')) {
             const _stall = document.createElement('div');
             _stall.className = 'stopped-indicator';
             const _lbl = document.createElement('span');
@@ -2444,8 +2466,18 @@ import createResearchSynapse from './researchSynapse.js';
         if (_streamContent) _streamContent.style.minHeight = '';
 
         // Finalize the last round's bubble — flatten stream-content wrapper for clean DOM
-        const finalDisplay = stripToolBlocks(roundText);
-        if (finalDisplay.trim()) {
+        if (assistantQuestionPayload) {
+          var _qBodyFinal = roundHolder.querySelector('.body');
+          var _qStreamContent = _qBodyFinal && _qBodyFinal.querySelector('.stream-content');
+          if (_qStreamContent && !_qStreamContent.textContent.trim() && !_qStreamContent.children.length) {
+            _qStreamContent.remove();
+          }
+          if (_qBodyFinal && !_qBodyFinal.querySelector('.assistant-question-card')) {
+            _qBodyFinal.appendChild(renderAssistantQuestionCard(assistantQuestionPayload));
+          }
+        }
+        const finalDisplay = assistantQuestionPayload ? '' : stripToolBlocks(roundText);
+        if (!assistantQuestionPayload && finalDisplay.trim()) {
           var _body4 = roundHolder.querySelector('.body');
           // Preserve sources expanded state before final render
           var _wasExpanded = _sourcesExpanded || !!(_body4 && _body4.querySelector('.sources-content.expanded'));
@@ -2504,11 +2536,11 @@ import createResearchSynapse from './researchSynapse.js';
               + markdownModule.processWithThinking(markdownModule.squashOutsideCode(finalDisplay))
               + (_findingsData ? chatRenderer.buildFindingsBox(_findingsData) : '');
           }
-        } else if (_sourcesHtml) {
+        } else if (!assistantQuestionPayload && _sourcesHtml) {
           var _body4b = roundHolder.querySelector('.body');
           var _wasExpanded2 = _sourcesExpanded || !!(_body4b && _body4b.querySelector('.sources-content.expanded'));
           _body4b.innerHTML = _sourcesData ? _buildSourcesBox(_sourcesData, _sourcesType, _wasExpanded2) : _sourcesHtml;
-        } else if (roundHolder !== holder) {
+        } else if (!assistantQuestionPayload && roundHolder !== holder) {
           // Check if there's thinking content worth showing
           const _thinkingOnly = markdownModule.extractThinkingBlocks(roundText);
           if (_thinkingOnly.thinkingBlocks?.length && !_thinkingOnly.content) {
@@ -2566,12 +2598,12 @@ import createResearchSynapse from './researchSynapse.js';
           _appendViewReportLink(footerTarget, streamSessionId);
         }
         // Also store raw on the footer target so copy/TTS work
-        if (footerTarget !== holder) footerTarget.dataset.raw = accumulated;
-        if (addAITTSButton && accumulated && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
+        if (footerTarget !== holder) footerTarget.dataset.raw = finalAssistantRaw;
+        if (!assistantQuestionPayload && addAITTSButton && accumulated && window.aiTTSManager?._provider !== 'disabled' && window.aiTTSManager?.available) {
           addAITTSButton(footerTarget, accumulated);
         }
         // TTS auto-play: streaming mode flushes remaining text, non-streaming enqueues full message
-        if (accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
+        if (!assistantQuestionPayload && accumulated && window.aiTTSManager && window.aiTTSManager.autoPlay) {
           const ttsBtn = holder.querySelector('.ai-tts-button');
           if (ttsBtn) {
             var ICON_PLAY_TTS = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"/></svg>';

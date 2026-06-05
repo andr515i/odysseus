@@ -21,6 +21,8 @@ from src.model_context import estimate_tokens
 from src.chat_helpers import coerce_message_and_session
 from src.endpoint_resolver import normalize_base as _normalize_base, build_chat_url
 from src.prompt_security import untrusted_context_message
+from src.agent_questions import normalize_question_payload, question_message_content
+from src.agent_tools import strip_tool_blocks
 from core.exceptions import SessionNotFoundError
 from src.auth_helpers import get_current_user
 from routes.session_routes import _verify_session_owner
@@ -58,6 +60,48 @@ def _stream_set(session_id: str, **fields) -> None:
     if rec is None:
         return
     rec.update(fields)
+
+
+def _save_assistant_question_response(
+    sess,
+    session_manager,
+    session_id: str,
+    payload: dict,
+    last_metrics: dict | None,
+    *,
+    preface: str = "",
+    character_name: str = None,
+    incognito: bool = False,
+):
+    """Persist an assistant question card as a normal assistant message."""
+    clean_preface = strip_tool_blocks(preface or "").strip()
+    md = dict(last_metrics) if last_metrics else {}
+    md["model"] = sess.model
+    md["assistant_question"] = payload
+    md["awaiting_user"] = True
+    if character_name:
+        md["character_name"] = character_name
+
+    content, md = clean_thinking_for_save(
+        question_message_content(payload, clean_preface),
+        md,
+    )
+    sess.add_message(ChatMessage("assistant", content, metadata=md))
+
+    if not incognito:
+        from core.database import update_session_last_accessed
+        update_session_last_accessed(session_id)
+        session_manager.save_sessions()
+
+    if incognito:
+        return None
+    try:
+        meta = getattr(sess.history[-1], "metadata", None)
+        if isinstance(meta, dict):
+            return meta.get("_db_id")
+    except (IndexError, AttributeError):
+        pass
+    return None
 
 
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
@@ -986,6 +1030,8 @@ def setup_chat_routes(
                 _agent_rounds = 0
                 _agent_tool_calls = 0
                 _answered_by = None  # set if the selected model failed and a fallback answered
+                _assistant_question_payload = None
+                _assistant_question_preface = ""
                 try:
                     from src.settings import get_setting
                     from src.agent_tools import MAX_AGENT_ROUNDS as _DEFAULT_ROUNDS
@@ -1030,6 +1076,18 @@ def setup_chat_routes(
                                 elif data.get("type") == "web_sources":
                                     web_sources = data.get("data", [])
                                     yield chunk
+                                elif data.get("type") == "assistant_question":
+                                    _assistant_question_payload = normalize_question_payload(data)
+                                    _assistant_question_preface = full_response
+                                    _stream_set(
+                                        session,
+                                        status="waiting_for_input",
+                                        partial=question_message_content(
+                                            _assistant_question_payload,
+                                            strip_tool_blocks(full_response).strip(),
+                                        ),
+                                    )
+                                    yield f'data: {json.dumps({"type": "assistant_question", **_assistant_question_payload})}\n\n'
                                 elif data.get("type") in (
                                     "tool_start", "tool_output", "agent_step",
                                     "doc_stream_open", "doc_stream_delta",
@@ -1057,7 +1115,18 @@ def setup_chat_routes(
                         elif chunk.startswith("event: "):
                             yield chunk
                         elif chunk == "data: [DONE]\n\n":
-                            if full_response:
+                            if _assistant_question_payload:
+                                _saved_id = _save_assistant_question_response(
+                                    sess, session_manager, session,
+                                    _assistant_question_payload,
+                                    last_metrics,
+                                    preface=_assistant_question_preface,
+                                    character_name=ctx.preset.character_name,
+                                    incognito=incognito,
+                                )
+                                if _saved_id:
+                                    yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
+                            elif full_response:
                                 _saved_id = save_assistant_response(
                                     sess, session_manager, session, full_response, last_metrics,
                                     character_name=ctx.preset.character_name,
@@ -1089,7 +1158,17 @@ def setup_chat_routes(
                     # outer finally from running and left _active_streams
                     # with a stale entry).
                     try:
-                        if full_response:
+                        if _assistant_question_payload:
+                            logger.info("Client disconnected after assistant question for session %s; saving question", session)
+                            _save_assistant_question_response(
+                                sess, session_manager, session,
+                                _assistant_question_payload,
+                                last_metrics,
+                                preface=_assistant_question_preface,
+                                character_name=ctx.preset.character_name,
+                                incognito=incognito,
+                            )
+                        elif full_response:
                             logger.info("Client disconnected mid-stream for session %s, saving partial response (%d chars)", session, len(full_response))
                             _stopped_content2, _stopped_md2 = clean_thinking_for_save(full_response, {"stopped": True, "model": sess.model})
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))

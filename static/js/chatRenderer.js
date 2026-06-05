@@ -407,7 +407,7 @@ function _openVisionEditor(att, userMsgEl) {
 // Tool call syntax patterns to strip from displayed text
 const TOOL_CALL_RE = /\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/gi;
 // Only strip fenced tool-call blocks that look like structured invocations, not regular code examples
-const EXEC_FENCE_RE = /```(?:web_search|read_file|write_file|create_document|edit_document|update_document)\s*\n[\s\S]*?```/gi;
+const EXEC_FENCE_RE = /```(?:web_search|web_fetch|ask_user|read_file|write_file|create_document|edit_document|update_document)\s*\n[\s\S]*?```/gi;
 // XML-style tool calls: <minimax:tool_call>, <tool_call>, <function_call>, bare <invoke>
 const XML_TOOL_CALL_RE = /<(?:[\w]+:)?(?:tool_call|function_call)>[\s\S]*?<\/(?:[\w]+:)?(?:tool_call|function_call)>/gi;
 const XML_INVOKE_RE = /<invoke\s+name=['"][^'"]*['"]>[\s\S]*?<\/invoke>/gi;
@@ -1232,6 +1232,133 @@ export function buildImageBubble(imageUrl, prompt, model, size, quality, imageId
   return wrap;
 }
 
+function _coerceAssistantQuestionPayload(payload) {
+  const src = payload && typeof payload === 'object' ? payload : {};
+  const choices = Array.isArray(src.choices) ? src.choices : [];
+  return {
+    question_id: String(src.question_id || src.id || ''),
+    question: String(src.question || src.prompt || src.text || 'What would you like to do next?').trim(),
+    choices: choices.map((choice) => {
+      if (choice && typeof choice === 'object') {
+        const label = String(choice.label || choice.text || choice.value || '').trim();
+        return {
+          label,
+          value: String(choice.value || label).trim(),
+          description: String(choice.description || choice.hint || '').trim(),
+        };
+      }
+      const label = String(choice || '').trim();
+      return { label, value: label, description: '' };
+    }).filter(choice => choice.label),
+    allow_free_text: src.allow_free_text !== false,
+  };
+}
+
+function _markAssistantQuestionAnswered(card) {
+  if (!card) return;
+  card.classList.add('answered');
+  card.querySelectorAll('button, textarea').forEach(el => { el.disabled = true; });
+}
+
+function _submitAssistantQuestionAnswer(card, answer) {
+  if (card?.dataset.submitting === 'true') return;
+  const clean = String(answer || '').trim();
+  if (!clean) {
+    uiModule.showToast?.('Enter an answer first', 2500);
+    return;
+  }
+
+  const msgInput = document.getElementById('message');
+  if (!msgInput) return;
+  if (card) card.dataset.submitting = 'true';
+  _markAssistantQuestionAnswered(card);
+  const questionText = card?.querySelector('.assistant-question-text')?.textContent?.trim();
+  msgInput.value = questionText
+    ? `Answer to your question: ${clean}\n\nQuestion I am answering: ${questionText}\n\nContinue from the plan you were building.`
+    : `Answer to your question: ${clean}\n\nContinue from the plan you were building.`;
+  msgInput.dispatchEvent(new Event('input', { bubbles: true }));
+  msgInput.focus();
+
+  const sendBtn = document.querySelector('.send-btn');
+  if (sendBtn && !sendBtn.disabled) {
+    sendBtn.click();
+  } else {
+    uiModule.showToast?.('Answer is ready to send', 2500);
+  }
+}
+
+export function renderAssistantQuestionCard(payload) {
+  const q = _coerceAssistantQuestionPayload(payload);
+  const card = document.createElement('div');
+  card.className = 'assistant-question-card';
+  if (q.question_id) card.dataset.questionId = q.question_id;
+
+  const label = document.createElement('div');
+  label.className = 'assistant-question-label';
+  label.textContent = 'Question';
+  card.appendChild(label);
+
+  const question = document.createElement('div');
+  question.className = 'assistant-question-text';
+  question.textContent = q.question;
+  card.appendChild(question);
+
+  if (q.choices.length) {
+    const choices = document.createElement('div');
+    choices.className = 'assistant-question-choices';
+    q.choices.forEach((choice) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'assistant-question-choice';
+      btn.dataset.answer = choice.value || choice.label;
+      const title = document.createElement('span');
+      title.className = 'assistant-question-choice-label';
+      title.textContent = choice.label;
+      btn.appendChild(title);
+      if (choice.description) {
+        const desc = document.createElement('span');
+        desc.className = 'assistant-question-choice-desc';
+        desc.textContent = choice.description;
+        btn.appendChild(desc);
+      }
+      btn.addEventListener('click', () => {
+        _submitAssistantQuestionAnswer(card, btn.dataset.answer || choice.label);
+      });
+      choices.appendChild(btn);
+    });
+    card.appendChild(choices);
+  }
+
+  if (q.allow_free_text) {
+    const free = document.createElement('div');
+    free.className = 'assistant-question-freeform';
+    const ta = document.createElement('textarea');
+    ta.className = 'assistant-question-input';
+    ta.rows = 2;
+    ta.placeholder = 'Type your answer...';
+    const send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'assistant-question-send';
+    send.textContent = 'Answer';
+    send.addEventListener('click', () => _submitAssistantQuestionAnswer(card, ta.value));
+    ta.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        _submitAssistantQuestionAnswer(card, ta.value);
+      }
+    });
+    free.appendChild(ta);
+    free.appendChild(send);
+    card.appendChild(free);
+  }
+
+  const hint = document.createElement('div');
+  hint.className = 'assistant-question-hint';
+  hint.textContent = 'Your answer starts the next turn in this chat.';
+  card.appendChild(hint);
+  return card;
+}
+
 export function hideWelcomeScreen() {
   const ws = document.getElementById('welcome-screen');
   const cc = document.getElementById('chat-container');
@@ -2030,6 +2157,35 @@ export function addMessage(role, content, modelName, metadata) {
         }
       }
 
+      if (metadata?.assistant_question) {
+        let qTarget = lastMsgAi;
+        if (!qTarget || !qTarget.querySelector('.body')) {
+          qTarget = document.createElement('div');
+          qTarget.className = 'msg msg-ai' + (firstMsgAi ? ' msg-continuation' : '');
+          const roleEl = document.createElement('div');
+          roleEl.className = 'role';
+          const contModel = modelName || metadata?.model;
+          roleEl.textContent = shortModel(contModel);
+          applyModelColor(roleEl, contModel);
+          if (!firstMsgAi) roleEl.appendChild(roleTimestamp(metadata?.timestamp));
+          qTarget.appendChild(roleEl);
+          const body = document.createElement('div');
+          body.className = 'body';
+          const questionText = markdownModule.squashOutsideCode(stripToolBlocks(textRaw || ''));
+          if (questionText.trim()) {
+            body.innerHTML = markdownModule.processWithThinking(questionText);
+          }
+          qTarget.appendChild(body);
+          qTarget.dataset.raw = questionText;
+          if (metadata?._db_id) qTarget.dataset.dbId = metadata._db_id;
+          box.appendChild(qTarget);
+          if (!firstMsgAi) firstMsgAi = qTarget;
+          lastMsgAi = qTarget;
+          lastWrap = qTarget;
+        }
+        qTarget.querySelector('.body').appendChild(renderAssistantQuestionCard(metadata.assistant_question));
+      }
+
       const firstWrap = lastMsgAi || lastWrap;
       if (firstWrap && firstWrap.classList.contains('msg-ai')) {
         if (metadata?.memories_used?.length) firstWrap._memoriesUsed = metadata.memories_used;
@@ -2123,6 +2279,9 @@ export function addMessage(role, content, modelName, metadata) {
       b.innerHTML = sourcesPrefix + thinkHtml + findingsSuffix;
     } else {
       b.innerHTML = sourcesPrefix + markdownModule.processWithThinking(text) + findingsSuffix;
+    }
+    if (role === 'assistant' && metadata?.assistant_question) {
+      b.appendChild(renderAssistantQuestionCard(metadata.assistant_question));
     }
 
     // The vision/OCR caption is stripped from the displayed text above (so the
@@ -2345,6 +2504,7 @@ const chatRenderer = {
   buildFindingsBox,
   appendReportButton,
   buildImageBubble,
+  renderAssistantQuestionCard,
   hideWelcomeScreen,
   showWelcomeScreen,
   createMsgFooter,

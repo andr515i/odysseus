@@ -2049,6 +2049,83 @@ body.bg-pattern-sparkles {
     .msg-ai .body {
       color: var(--fg);
     }
+    .assistant-question-card {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--red) 7%, var(--panel));
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .assistant-question-label {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--red);
+      font-weight: 700;
+    }
+    .assistant-question-text {
+      font-weight: 600;
+      line-height: 1.45;
+    }
+    .assistant-question-choices {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .assistant-question-choice,
+    .assistant-question-send {
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: color-mix(in srgb, var(--fg) 7%, var(--panel));
+      color: var(--fg);
+      padding: 7px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+    .assistant-question-choice {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+      max-width: 260px;
+      text-align: left;
+    }
+    .assistant-question-choice:hover,
+    .assistant-question-send:hover {
+      border-color: var(--red);
+      background: color-mix(in srgb, var(--red) 12%, var(--panel));
+    }
+    .assistant-question-choice-desc {
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+      font-size: 12px;
+      line-height: 1.3;
+    }
+    .assistant-question-freeform {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+    .assistant-question-input {
+      flex: 1;
+      min-height: 42px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--input-bg, var(--bg));
+      color: var(--fg);
+      padding: 8px;
+      font: inherit;
+    }
+    .assistant-question-hint {
+      color: color-mix(in srgb, var(--fg) 55%, transparent);
+      font-size: 12px;
+    }
+    .assistant-question-card.answered {
+      opacity: 0.72;
+    }
     .rag-sources {
       margin-top: 12px;
       border: 1px solid var(--border);
