@@ -214,8 +214,8 @@
     })();
   </script>
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="modulepreload" href="/static/app.js">
-  <link rel="modulepreload" href="/static/js/chat.js">
+  <link rel="modulepreload" href="/static/app.js?v=20260605c">
+  <link rel="modulepreload" href="/static/js/chat.js?v=20260605c">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
   <link rel="modulepreload" href="/static/js/markdown.js">
@@ -2281,7 +2281,7 @@
 <script type="module" src="/static/js/chatRenderer.js"></script>
 <script type="module" src="/static/js/codeRunner.js"></script>
 <script type="module" src="/static/js/chatStream.js"></script>
-<script type="module" src="/static/js/chat.js?v=20260604s"></script>
+<script type="module" src="/static/js/chat.js?v=20260605c"></script>
 <script type="module" src="/static/js/cookbook.js"></script>
 <script src="/static/js/cookbookSchedule.js"></script>
 <script type="module" src="/static/js/search-chat.js"></script>
@@ -2291,9 +2291,9 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/app.js?v=20260605c"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
-<script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js').catch(()=>{});}</script>
+<script nonce="{{CSP_NONCE}}">if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js?v=20260605c',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{});}</script>
 </body>
 </html>
