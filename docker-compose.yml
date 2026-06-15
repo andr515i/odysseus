@@ -3,7 +3,8 @@ services:
     build: .
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
-    volumes:
+    volumes:      
+      - /home/quan/llama-stack/models:/models:ro
       - ./data:/app/data:z
       - ./logs:/app/logs:z
       # Cookbook remote-server SSH identity. Odysseus can generate a key here;
@@ -141,7 +142,29 @@ services:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
     restart: unless-stopped
 
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: odysseus-llama
+    restart: unless-stopped
+    gpus: all
+    shm_size: "1g"
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - /home/quan/llama-stack/models:/models:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["-m", "${LLAMA_MODEL:-/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}", "--host", "0.0.0.0", "--port", "8000", "--ctx-size", "65536", "--batch-size", "2048", "--ubatch-size", "512", "--parallel", "1", "--n-gpu-layers", "auto", "--fit", "on", "--fit-target", "1536", "--fit-ctx", "4096", "--flash-attn", "on", "--reasoning", "off", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--kv-offload", "--cache-ram", "1024", "--cache-reuse", "64", "--metrics", "--slots", "--log-timestamps"]
+
 volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+
